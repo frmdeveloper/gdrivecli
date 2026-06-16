@@ -1,0 +1,38 @@
+name: hehee
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v1
+        with:
+          go-version: 1.24
+
+      - name: build
+        run: |
+          go mod tidy
+          env GOOS=linux GOARCH=arm64 go build -o gd-linux-arm64
+          env GOOS=linux GOARCH=amd64 go build -o gd-linux-amd64
+          env GOOS=android GOARCH=arm64 go build -o gd-android-arm64
+          env GOOS=windows GOARCH=amd64 go build -o gd-amd64.exe
+          env GOOS=windows GOARCH=arm64 go build -o gd-arm64.exe
+          
+      - name: oke
+        run: ls -a
+
+      - name: Upload
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.TOKEN }}
+          tag: ${{ github.ref }}
+          file: ./gd-*
+          file_glob: true
