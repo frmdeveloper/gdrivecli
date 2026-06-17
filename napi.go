@@ -11,7 +11,6 @@ import (
 	_ "unsafe"
 
 	napi "sirherobrine23.com.br/Sirherobrine23/napi-go"
-	"sirherobrine23.com.br/Sirherobrine23/napi-go/js"
 	_ "sirherobrine23.com.br/Sirherobrine23/napi-go/module"
 
 	"google.golang.org/api/drive/v3"
@@ -56,7 +55,7 @@ func RegisterNapi(env napi.EnvType, export *napi.Object) {
 	}
 
 	bind := func(name string, fn any) {
-		val, err := js.GoFuncOf(env, fn)
+		val, err := napi.GoFuncOf(env, fn)
 		if err != nil {
 			panic(fmt.Sprintf("gdrive: gagal bind %q: %v", name, err))
 		}
@@ -186,10 +185,14 @@ func RegisterNapi(env napi.EnvType, export *napi.Object) {
 			}
 		}()
 
-		return map[string]any{
-			"stop": func() {
-				once.Do(func() { close(stopCh) })
-			},
-		}, nil
+		stopFn, err := napi.GoFuncOf(env, func() {
+			once.Do(func() { close(stopCh) })
+		})
+		if err != nil {
+			once.Do(func() { close(stopCh) })
+			return nil, err
+		}
+
+		return map[string]any{"stop": stopFn}, nil
 	})
 }
