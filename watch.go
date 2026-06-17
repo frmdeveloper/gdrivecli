@@ -6,123 +6,129 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"google.golang.org/api/drive/v3"
 )
 
-const defaultPollInterval = 1 * time.Second
-
-// fileState menyimpan info untuk mendeteksi perubahan: kalau mtime ATAU
-// ukuran berubah dibanding scan sebelumnya, file dianggap berubah dan
-// di-upload ulang.
-type fileState struct {
-	modTime time.Time
-	size    int64
-}
+// debounce supaya editor yang tulis file beberapa kali cepat
+// (vim, vscode, dll) tidak spam upload.
+const debounceDelay = 300 * time.Millisecond
 
 func cmdWatch(srv *drive.Service, args []string) {
 	if len(args) < 2 {
-		fmt.Println("Penggunaan: gdrive watch <local-dir> <drive-folder-id> [interval]")
-		fmt.Println("Contoh interval: 1s (default), 500ms, 200ms, 2s")
-		os.Exit(1)
-	}
-	localDir := args[0]
-	rootFolderID := args[1]
-
-	interval := defaultPollInterval
-	if len(args) > 2 {
-		d, err := time.ParseDuration(args[2])
-		if err != nil || d <= 0 {
-			fmt.Fprintln(os.Stderr, "Error: interval tidak valid, contoh: 1s, 500ms, 200ms")
-			os.Exit(1)
-		}
-		interval = d
-	}
-
-	info, err := os.Stat(localDir)
-	if err != nil || !info.IsDir() {
-		fmt.Fprintln(os.Stderr, "Error: bukan folder yang valid:", localDir)
+		fmt.Println("Penggunaan: gdrive watch <local-dir> <drive-folder-id>")
 		os.Exit(1)
 	}
 
-	cache := newFolderCache(srv, rootFolderID)
-	known := make(map[string]fileState)
-
-	fmt.Printf("Memantau %s -> Drive folder %s (cek tiap %s)\n", localDir, rootFolderID, interval)
+	fmt.Printf("👁️  Memantau %s -> Drive %s\n", args[0], args[1])
 	fmt.Println("Tekan Ctrl+C untuk berhenti.")
 
-	for {
-		scanOnce(srv, cache, localDir, known)
-		time.Sleep(interval)
+	// stopCh = nil → select case-nya tidak pernah ready → jalan selamanya
+	// sampai Ctrl+C mematikan proses (cocok untuk CLI).
+	if err := startWatch(srv, args[0], args[1], nil); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(1)
 	}
 }
 
-// scanOnce memindai folder lokal sekali: file baru/berubah (mtime atau
-// ukuran beda) di-upload/update ke Drive, dan file yang sebelumnya
-// terpantau tapi sekarang sudah tidak ada lagi ikut dihapus dari Drive.
-//
-// Pakai polling (bukan fsnotify) karena di Termux/Android, folder yang
-// dipasang lewat shared storage (~/storage/...) memakai FUSE dan biasanya
-// tidak meneruskan event inotify -- watcher berbasis event jadi tidak
-// mendeteksi perubahan sama sekali. Polling jalan di semua jenis filesystem.
-func scanOnce(srv *drive.Service, cache *folderCache, localDir string, known map[string]fileState) {
-	current := make(map[string]fileState)
+// startWatch menjalankan watcher fsnotify hingga stopCh ditutup (atau
+// selamanya kalau stopCh nil). Dipakai oleh cmdWatch (CLI) dan oleh
+// Node.js addon (watch yang bisa di-stop dari JS).
+func startWatch(srv *drive.Service, localDir, rootFolderID string, stopCh <-chan struct{}) error {
+	if info, err := os.Stat(localDir); err != nil || !info.IsDir() {
+		return fmt.Errorf("bukan folder yang valid: %s", localDir)
+	}
 
-	_ = filepath.WalkDir(localDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil // lewati entry yang error dibaca, lanjut scan yang lain
-		}
-		if path != localDir && strings.HasPrefix(d.Name(), ".") {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("gagal buat watcher: %w", err)
+	}
+	defer watcher.Close()
+
+	// Daftarkan semua subfolder yang sudah ada ke watcher (fsnotify
+	// tidak rekursif secara otomatis).
+	_ = filepath.WalkDir(localDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || !d.IsDir() {
 			return nil
 		}
-		if d.IsDir() {
-			return nil
-		}
-
-		info, infoErr := d.Info()
-		if infoErr != nil {
-			return nil
-		}
-
-		rel, relErr := filepath.Rel(localDir, path)
-		if relErr != nil {
-			return nil
-		}
-		rel = filepath.ToSlash(rel)
-
-		state := fileState{modTime: info.ModTime(), size: info.Size()}
-		current[rel] = state
-
-		old, seen := known[rel]
-		if !seen || !old.modTime.Equal(state.modTime) || old.size != state.size {
-			uploadFile(srv, cache, path, rel)
-		}
-		return nil
+		return watcher.Add(path)
 	})
 
-	// File yang dulu ada (known) tapi sekarang tidak terlihat lagi di scan
-	// -> dianggap dihapus secara lokal, hapus juga di Drive.
-	for rel := range known {
-		if _, stillExists := current[rel]; !stillExists {
-			deleteFromDrive(srv, cache, rel)
-		}
-	}
+	cache := newFolderCache(srv, rootFolderID)
 
-	for k := range known {
-		delete(known, k)
-	}
-	for k, v := range current {
-		known[k] = v
+	var mu sync.Mutex
+	timers := make(map[string]*time.Timer)
+
+	for {
+		select {
+		case <-stopCh:
+			return nil
+
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+
+			// Abaikan file/folder hidden dan temp
+			if strings.HasPrefix(filepath.Base(event.Name), ".") {
+				continue
+			}
+
+			switch {
+			// ── Folder baru → daftarkan ke watcher ──────────────────
+			case event.Has(fsnotify.Create):
+				if fi, statErr := os.Stat(event.Name); statErr == nil && fi.IsDir() {
+					_ = watcher.Add(event.Name)
+					continue
+				}
+				fallthrough // file baru → upload (lewat debounce Write)
+
+			// ── File ditulis / dibuat → upload ──────────────────────
+			case event.Has(fsnotify.Write):
+				path := event.Name
+				rel, relErr := filepath.Rel(localDir, path)
+				if relErr != nil {
+					continue
+				}
+				rel = filepath.ToSlash(rel)
+
+				mu.Lock()
+				if t, exists := timers[path]; exists {
+					t.Stop()
+				}
+				timers[path] = time.AfterFunc(debounceDelay, func() {
+					if fi, statErr := os.Stat(path); statErr == nil && !fi.IsDir() {
+						uploadFile(srv, cache, path, rel)
+					}
+					mu.Lock()
+					delete(timers, path)
+					mu.Unlock()
+				})
+				mu.Unlock()
+
+			// ── File dihapus / di-rename → hapus di Drive ───────────
+			case event.Has(fsnotify.Remove), event.Has(fsnotify.Rename):
+				rel, relErr := filepath.Rel(localDir, event.Name)
+				if relErr != nil {
+					continue
+				}
+				go deleteFromDrive(srv, cache, filepath.ToSlash(rel))
+			}
+
+		case watchErr, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			fmt.Fprintln(os.Stderr, "watcher error:", watchErr)
+		}
 	}
 }
 
 // uploadFile upload (atau update kalau nama sudah ada) satu file ke folder
-// Drive yang sesuai relPath, membuat sub-folder Drive sesuai struktur lokal
-// kalau perlu.
+// Drive yang sesuai relPath.
 func uploadFile(srv *drive.Service, cache *folderCache, localPath, relPath string) {
 	relPath = filepath.ToSlash(relPath)
 	name := filepath.Base(relPath)
@@ -165,9 +171,7 @@ func uploadFile(srv *drive.Service, cache *folderCache, localPath, relPath strin
 	fmt.Printf("[upload] %s\n", relPath)
 }
 
-// deleteFromDrive menghapus (permanen) file di Drive yang namanya cocok
-// dengan relPath, kalau ada. Dipanggil saat file lokal yang sebelumnya
-// terpantau sudah tidak ada lagi.
+// deleteFromDrive menghapus permanen file di Drive yang cocok dengan relPath.
 func deleteFromDrive(srv *drive.Service, cache *folderCache, relPath string) {
 	relPath = filepath.ToSlash(relPath)
 	name := filepath.Base(relPath)
@@ -175,18 +179,12 @@ func deleteFromDrive(srv *drive.Service, cache *folderCache, relPath string) {
 
 	parentID, ok := cache.lookupFolder(relDir)
 	if !ok {
-		// Folder induknya belum pernah dibuat di Drive, berarti file ini
-		// juga belum pernah ter-upload -> tidak ada yang perlu dihapus.
 		return
 	}
 
 	q := fmt.Sprintf("name = '%s' and '%s' in parents and trashed = false", escapeQueryValue(name), parentID)
 	r, err := srv.Files.List().Q(q).Fields("files(id)").PageSize(1).Do()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[%s] gagal cek Drive sebelum hapus: %v\n", relPath, err)
-		return
-	}
-	if len(r.Files) == 0 {
+	if err != nil || len(r.Files) == 0 {
 		return
 	}
 
@@ -201,10 +199,9 @@ func escapeQueryValue(s string) string {
 	return strings.ReplaceAll(s, "'", "\\'")
 }
 
-// folderCache memetakan path relatif lokal ("." = root) -> Drive folder ID,
-// membuat folder Drive baru (atau memakai yang sudah ada by name) secara
-// lazy dan menyimpannya di cache supaya tidak query berulang.
+// folderCache memetakan path relatif lokal → Drive folder ID, lazy + cached.
 type folderCache struct {
+	mu    sync.Mutex
 	srv   *drive.Service
 	cache map[string]string
 }
@@ -213,14 +210,13 @@ func newFolderCache(srv *drive.Service, rootID string) *folderCache {
 	return &folderCache{srv: srv, cache: map[string]string{".": rootID}}
 }
 
-// lookupFolder mengembalikan Drive folder ID untuk relPath HANYA kalau
-// sudah ada di cache (tidak membuat folder baru). Dipakai sebelum hapus,
-// supaya tidak bikin folder kosong cuma untuk dicek isinya.
 func (c *folderCache) lookupFolder(relPath string) (string, bool) {
 	relPath = filepath.ToSlash(relPath)
 	if relPath == "" {
 		relPath = "."
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	id, ok := c.cache[relPath]
 	return id, ok
 }
@@ -231,9 +227,12 @@ func (c *folderCache) ensureFolder(relPath string) (string, error) {
 		return c.cache["."], nil
 	}
 
+	c.mu.Lock()
 	if id, ok := c.cache[relPath]; ok {
+		c.mu.Unlock()
 		return id, nil
 	}
+	c.mu.Unlock()
 
 	parentID, err := c.ensureFolder(filepath.Dir(relPath))
 	if err != nil {
@@ -241,6 +240,12 @@ func (c *folderCache) ensureFolder(relPath string) (string, error) {
 	}
 
 	name := filepath.Base(relPath)
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if id, ok := c.cache[relPath]; ok {
+		return id, nil
+	}
 
 	q := fmt.Sprintf("name = '%s' and '%s' in parents and mimeType = '%s' and trashed = false",
 		escapeQueryValue(name), parentID, folderMimeType)
@@ -262,7 +267,7 @@ func (c *folderCache) ensureFolder(relPath string) (string, error) {
 			return "", createErr
 		}
 		id = created.Id
-		fmt.Printf("[mkdir] %s (folder baru di Drive)\n", relPath)
+		fmt.Printf("[mkdir] %s\n", relPath)
 	}
 
 	c.cache[relPath] = id

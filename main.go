@@ -1,3 +1,5 @@
+//go:build !napi
+
 package main
 
 import (
