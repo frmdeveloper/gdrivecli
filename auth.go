@@ -10,21 +10,23 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	"google.golang.org/api/drive/v3"
-	"google.golang.org/api/option"
 )
 
 const (
 	credentialsFile = "credentials.json"
 	tokenFile       = "token.json"
 	redirectURL     = "http://127.0.0.1:8765/callback"
+	driveScope      = "https://www.googleapis.com/auth/drive"
 )
 
-// getDriveService menyiapkan client Drive API. Kalau belum ada token
-// tersimpan, akan menjalankan OAuth flow (buka browser sekali).
-func getDriveService() (*drive.Service, error) {
-	ctx := context.Background()
+// DriveClient adalah HTTP client yang sudah ter-autentikasi untuk Google Drive.
+type DriveClient struct {
+	http *http.Client
+}
 
+// getDriveService menyiapkan DriveClient. Kalau belum ada token tersimpan,
+// akan menjalankan OAuth flow (buka browser sekali).
+func getDriveService() (*DriveClient, error) {
 	b, err := os.ReadFile(credentialsFile)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -34,19 +36,14 @@ func getDriveService() (*drive.Service, error) {
 		)
 	}
 
-	config, err := google.ConfigFromJSON(b, drive.DriveScope)
+	config, err := google.ConfigFromJSON(b, driveScope)
 	if err != nil {
 		return nil, fmt.Errorf("gagal parse credentials: %w", err)
 	}
 	config.RedirectURL = redirectURL
 
 	client := getClient(config)
-
-	srv, err := drive.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		return nil, fmt.Errorf("gagal buat Drive service: %w", err)
-	}
-	return srv, nil
+	return &DriveClient{http: client}, nil
 }
 
 func getClient(config *oauth2.Config) *http.Client {
@@ -58,9 +55,6 @@ func getClient(config *oauth2.Config) *http.Client {
 
 	ts := config.TokenSource(context.Background(), tok)
 
-	// Kalau access token sudah expired, TokenSource otomatis refresh
-	// pakai refresh token. Simpan ulang hasilnya supaya tidak perlu
-	// login lagi lain kali.
 	if newTok, err := ts.Token(); err == nil && newTok.AccessToken != tok.AccessToken {
 		saveToken(newTok)
 	}
@@ -68,8 +62,6 @@ func getClient(config *oauth2.Config) *http.Client {
 	return oauth2.NewClient(context.Background(), ts)
 }
 
-// getTokenFromWeb menjalankan local HTTP server untuk menangkap redirect
-// OAuth (loopback flow), lalu menukar authorization code dengan token.
 func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
 	codeCh := make(chan string, 1)
 

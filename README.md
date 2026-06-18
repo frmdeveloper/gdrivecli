@@ -31,8 +31,6 @@ go build -o gdrive .
 go build -tags napi -buildmode=c-shared -o gdrive.node .
 ```
 
-> `go mod tidy` cukup sekali, berlaku untuk kedua build.
-
 ### 🔓 3. Login pertama kali
 
 ```bash
@@ -58,7 +56,7 @@ go build -tags napi -buildmode=c-shared -o gdrive.node .
 | `gdrive search [-l] <kata-kunci>` | 🔍 Cari file berdasarkan nama |
 | `gdrive info <file-id>` | ℹ️ Detail file (ukuran, tipe, link, dll) |
 | `gdrive restore <folder-id> <dir>` | ♻️ Download seluruh folder rekursif |
-| `gdrive watch <dir> <folder-id>` | 👁️ Sinkron 2 arah otomatis (event-driven) |
+| `gdrive watch <dir> <folder-id>` | 👁️ Sinkron otomatis (event-driven) |
 
 ---
 
@@ -79,14 +77,9 @@ d | Proyek | - | 1BxYz...
 - | foto.jpg | 3.4 MiB | 1AbCd...
 ```
 
-```bash
-./gdrive list -l                # 📋 list root dengan ID
-./gdrive search -l catatan      # 🔍 cari + tampilkan ID
-```
-
 ---
 
-## ♻️ `restore` — download & timpa seluruh folder
+## ♻️ `restore` — download seluruh folder
 
 ```bash
 ./gdrive restore 1AbCdEfGhIjKlMnOp ./restore-data
@@ -98,7 +91,7 @@ d | Proyek | - | 1BxYz...
 
 ---
 
-## 👁️ `watch` — sinkron 2 arah otomatis
+## 👁️ `watch` — sinkron otomatis
 
 ```bash
 ./gdrive watch ./data 1AbCdEfGhIjKlMnOp
@@ -111,24 +104,23 @@ d | Proyek | - | 1BxYz...
 | 🗑️ File dihapus / di-rename | Hapus permanen di Drive seketika |
 | 🙈 File/folder berawalan `.` | Diabaikan (hidden/temp) |
 
-Berbasis **event** (fsnotify/inotify) — bereaksi seketika saat ada perubahan, tanpa polling.
-
-> ⚠️ **Hapus lokal = hapus permanen di Drive.** Jangan `watch` di folder yang dibersihkan otomatis proses lain kalau Drive ini satu-satunya backup-mu.
-
-> 💡 Kalau jalan di folder shared storage Termux (`~/storage/...`) dan perubahan tidak terdeteksi, itu karena FUSE tidak meneruskan event inotify. Solusinya: taruh file di storage internal Termux (`~/`) yang jalan normal.
+> ⚠️ **Hapus lokal = hapus permanen di Drive.**
 
 ---
 
 ## 🟨 Penggunaan dari Node.js
 
-Setelah build addon, `require` langsung dari Node.js:
+Setelah build `gdrive.node`, semua fungsi langsung tersedia tanpa `create()`:
 
 ```js
 const gdrive = require('./gdrive.node')
 
-// List root
+// List folder (default: root)
 const files = gdrive.list()
 console.log(files) // DriveFile[]
+
+// List folder tertentu
+const folder = gdrive.list('1AbCdEfGhIjKlMnOp')
 
 // Upload
 const uploaded = gdrive.upload('./laporan.pdf', '1AbCdEfGhIjKlMnOp')
@@ -141,12 +133,12 @@ const results = gdrive.search('laporan')
 const bytes = gdrive.download('1AbCd...', './output.pdf')
 
 // Mkdir
-const folder = gdrive.mkdir('Backup', '1AbCd...')
+const newFolder = gdrive.mkdir('Backup', '1AbCd...')
 
-// Hapus (nama remove, bukan delete — reserved keyword di JS)
+// Hapus permanen
 gdrive.remove('1AbCd...')
 
-// Info
+// Info detail file
 const detail = gdrive.info('1AbCd...')
 
 // Restore seluruh folder Drive ke lokal
@@ -155,20 +147,47 @@ const { ok, failed } = gdrive.restore('1AbCd...', './restore-data')
 // Watch — jalan di goroutine, tidak memblokir
 const watcher = gdrive.watch('./data', '1AbCd...')
 // ... lakukan hal lain ...
-watcher.stop() // hentikan saat selesai
+watcher.stop()
 ```
 
-TypeScript definitions tersedia di `gdrive.d.ts`.
+### TypeScript
 
-Karena semua fungsi (kecuali `watch`) **sinkron dan memblokir**, untuk penggunaan
-production gunakan `worker_threads`:
+```ts
+interface DriveFile {
+  id: string
+  name: string
+  mimeType: string
+  size: number
+  isDir: boolean
+  createdTime?: string
+  modifiedTime?: string
+  webViewLink?: string
+  parents?: string[]
+}
+
+interface GDrive {
+  list(folderId?: string): DriveFile[]
+  search(keyword: string): DriveFile[]
+  upload(localPath: string, folderId?: string): DriveFile
+  download(fileId: string, outputPath?: string): number
+  mkdir(name: string, parentId?: string): DriveFile
+  remove(fileId: string): void
+  info(fileId: string): DriveFile
+  restore(folderId: string, localDir: string): { ok: number; failed: number }
+  watch(localDir: string, folderId: string): { stop(): void }
+}
+
+const gdrive: GDrive = require('./gdrive.node')
+```
+
+> Karena semua fungsi **sinkron**, untuk production gunakan `worker_threads`:
 
 ```js
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads')
 
 if (isMainThread) {
   const w = new Worker(__filename, { workerData: { folderId: '1AbCd...' } })
-  w.on('message', files => console.log('files:', files))
+  w.on('message', files => console.log(files))
 } else {
   const gdrive = require('./gdrive.node')
   parentPort.postMessage(gdrive.list(workerData.folderId))
@@ -177,8 +196,9 @@ if (isMainThread) {
 
 ---
 
+## 📝 Catatan
 
-
-- 🚫 `credentials.json` dan `token.json` jangan di-commit ke git → sudah masuk `.gitignore`
-- ☠️ `gdrive delete` dan `watch` (saat file lokal dihapus) bersifat **permanen**, bukan ke trash
-- 🔧 Scope: `drive` (full access). Untuk akses terbatas, ganti `drive.DriveScope` → `drive.DriveFileScope` di `auth.go`, lalu hapus `token.json` agar re-auth
+- 🚫 `credentials.json` dan `token.json` jangan di-commit ke git
+- ☠️ `delete` dan `watch` (saat file lokal dihapus) bersifat **permanen**, bukan ke trash
+- 🔧 Scope: `drive` (full access). Untuk akses terbatas ganti scope di `auth.go` → `https://www.googleapis.com/auth/drive.file`, lalu hapus `token.json`
+- 📦 Tidak ada dependency `google.golang.org/api` — semua komunikasi Drive pakai pure `net/http`

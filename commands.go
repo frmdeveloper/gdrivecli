@@ -3,17 +3,12 @@ package main
 import (
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"google.golang.org/api/drive/v3"
 )
 
-const folderMimeType = "application/vnd.google-apps.folder"
-
-func cmdList(srv *drive.Service, args []string) {
+func cmdList(srv *DriveClient, args []string) {
 	parent := "root"
 	long := false
 	for _, a := range args {
@@ -24,12 +19,7 @@ func cmdList(srv *drive.Service, args []string) {
 		parent = a
 	}
 
-	r, err := srv.Files.List().
-		Q(fmt.Sprintf("'%s' in parents and trashed = false", parent)).
-		PageSize(100).
-		OrderBy("folder,name").
-		Fields("files(id, name, mimeType, size)").
-		Do()
+	r, err := srv.ListFiles(parent, "")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -43,7 +33,7 @@ func cmdList(srv *drive.Service, args []string) {
 	printFileList(r.Files, long)
 }
 
-func cmdSearch(srv *drive.Service, args []string) {
+func cmdSearch(srv *DriveClient, args []string) {
 	var keyword string
 	long := false
 	for _, a := range args {
@@ -58,12 +48,7 @@ func cmdSearch(srv *drive.Service, args []string) {
 		os.Exit(1)
 	}
 
-	r, err := srv.Files.List().
-		Q(fmt.Sprintf("name contains '%s' and trashed = false", keyword)).
-		PageSize(50).
-		OrderBy("folder,name").
-		Fields("files(id, name, mimeType, size)").
-		Do()
+	r, err := srv.SearchFiles(keyword)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -77,11 +62,7 @@ func cmdSearch(srv *drive.Service, args []string) {
 	printFileList(r.Files, long)
 }
 
-// printFileList menampilkan daftar file dengan format:
-//
-//	d | nama-folder | -
-//	- | nama-file   | 1.2 MiB | <id>  (hanya kalau long=true)
-func printFileList(files []*drive.File, long bool) {
+func printFileList(files []*DriveFile, long bool) {
 	for _, f := range files {
 		typ := "-"
 		size := humanSize(f.Size)
@@ -97,7 +78,6 @@ func printFileList(files []*drive.File, long bool) {
 	}
 }
 
-// humanSize mengubah ukuran byte ke bentuk ringkas (B/KiB/MiB/GiB/...).
 func humanSize(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -111,7 +91,7 @@ func humanSize(b int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-func cmdUpload(srv *drive.Service, args []string) {
+func cmdUpload(srv *DriveClient, args []string) {
 	if len(args) < 1 {
 		fmt.Println("Penggunaan: gdrive upload <path-file> [parent-folder-id]")
 		os.Exit(1)
@@ -125,12 +105,12 @@ func cmdUpload(srv *drive.Service, args []string) {
 	}
 	defer f.Close()
 
-	meta := &drive.File{Name: filepath.Base(path)}
+	var parents []string
 	if len(args) > 1 {
-		meta.Parents = []string{args[1]}
+		parents = []string{args[1]}
 	}
 
-	uploaded, err := srv.Files.Create(meta).Media(f).Fields("id, name, size").Do()
+	uploaded, err := srv.CreateFile(filepath.Base(path), parents, f, "id,name,size")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error upload:", err)
 		os.Exit(1)
@@ -139,14 +119,14 @@ func cmdUpload(srv *drive.Service, args []string) {
 	fmt.Printf("Upload berhasil: %s (%d bytes)\nID: %s\n", uploaded.Name, uploaded.Size, uploaded.Id)
 }
 
-func cmdDownload(srv *drive.Service, args []string) {
+func cmdDownload(srv *DriveClient, args []string) {
 	if len(args) < 1 {
 		fmt.Println("Penggunaan: gdrive download <file-id> [output-path]")
 		os.Exit(1)
 	}
 	fileID := args[0]
 
-	meta, err := srv.Files.Get(fileID).Fields("name, mimeType").Do()
+	meta, err := srv.GetFile(fileID)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error ambil metadata:", err)
 		os.Exit(1)
@@ -156,7 +136,7 @@ func cmdDownload(srv *drive.Service, args []string) {
 	appendPdfExt := strings.HasPrefix(meta.MimeType, "application/vnd.google-apps.")
 	if len(args) > 1 {
 		destPath = args[1]
-		appendPdfExt = false // nama sudah ditentukan user, hormati apa adanya
+		appendPdfExt = false
 	}
 
 	finalPath, written, err := downloadToPath(srv, fileID, meta.MimeType, destPath, appendPdfExt)
@@ -168,28 +148,33 @@ func cmdDownload(srv *drive.Service, args []string) {
 	fmt.Printf("Download berhasil: %s (%d bytes)\n", finalPath, written)
 }
 
-// downloadToPath men-download (atau export ke PDF kalau Google Docs/Sheets/
-// Slides) sebuah file Drive ke destPath. Mengembalikan path final (bertambah
-// ".pdf" kalau appendPdfExt true dan tipenya Google-native) dan jumlah byte
-// yang ditulis. Dipakai oleh cmdDownload dan cmdRestore.
-func downloadToPath(srv *drive.Service, fileID, mimeType, destPath string, appendPdfExt bool) (string, int64, error) {
-	var resp *http.Response
-	var err error
+// downloadToPath men-download (atau export ke PDF kalau Google Docs/Sheets/Slides)
+// sebuah file Drive ke destPath.
+func downloadToPath(srv *DriveClient, fileID, mimeType, destPath string, appendPdfExt bool) (string, int64, error) {
+	var (
+		resp interface{ Body() io.ReadCloser }
+		body io.ReadCloser
+		err  error
+	)
 
 	if strings.HasPrefix(mimeType, "application/vnd.google-apps.") {
-		// Google Docs/Sheets/Slides tidak punya konten biner langsung,
-		// jadi di-export sebagai PDF.
 		if appendPdfExt {
 			destPath += ".pdf"
 		}
-		resp, err = srv.Files.Export(fileID, "application/pdf").Download()
+		r, e := srv.ExportFile(fileID, "application/pdf")
+		if e != nil {
+			return destPath, 0, e
+		}
+		body = r.Body
+		_ = resp
 	} else {
-		resp, err = srv.Files.Get(fileID).Download()
+		r, e := srv.DownloadFile(fileID)
+		if e != nil {
+			return destPath, 0, e
+		}
+		body = r.Body
 	}
-	if err != nil {
-		return destPath, 0, err
-	}
-	defer resp.Body.Close()
+	defer body.Close()
 
 	out, err := os.Create(destPath)
 	if err != nil {
@@ -197,25 +182,22 @@ func downloadToPath(srv *drive.Service, fileID, mimeType, destPath string, appen
 	}
 	defer out.Close()
 
-	written, err := io.Copy(out, resp.Body)
+	written, err := io.Copy(out, body)
 	return destPath, written, err
 }
 
-func cmdMkdir(srv *drive.Service, args []string) {
+func cmdMkdir(srv *DriveClient, args []string) {
 	if len(args) < 1 {
 		fmt.Println("Penggunaan: gdrive mkdir <nama-folder> [parent-id]")
 		os.Exit(1)
 	}
 
-	meta := &drive.File{
-		Name:     args[0],
-		MimeType: folderMimeType,
-	}
+	var parents []string
 	if len(args) > 1 {
-		meta.Parents = []string{args[1]}
+		parents = []string{args[1]}
 	}
 
-	created, err := srv.Files.Create(meta).Fields("id, name").Do()
+	created, err := srv.CreateFolder(args[0], parents)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -224,13 +206,13 @@ func cmdMkdir(srv *drive.Service, args []string) {
 	fmt.Printf("Folder dibuat: %s\nID: %s\n", created.Name, created.Id)
 }
 
-func cmdDelete(srv *drive.Service, args []string) {
+func cmdDelete(srv *DriveClient, args []string) {
 	if len(args) < 1 {
 		fmt.Println("Penggunaan: gdrive delete <file-id>")
 		os.Exit(1)
 	}
 
-	if err := srv.Files.Delete(args[0]).Do(); err != nil {
+	if err := srv.DeleteFile(args[0]); err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
@@ -238,15 +220,13 @@ func cmdDelete(srv *drive.Service, args []string) {
 	fmt.Println("Berhasil dihapus permanen.")
 }
 
-func cmdInfo(srv *drive.Service, args []string) {
+func cmdInfo(srv *DriveClient, args []string) {
 	if len(args) < 1 {
 		fmt.Println("Penggunaan: gdrive info <file-id>")
 		os.Exit(1)
 	}
 
-	f, err := srv.Files.Get(args[0]).
-		Fields("id, name, mimeType, size, createdTime, modifiedTime, parents, webViewLink").
-		Do()
+	f, err := srv.GetFile(args[0])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
